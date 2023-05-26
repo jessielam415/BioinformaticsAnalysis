@@ -1,0 +1,345 @@
+---
+title: "Assignment 2 - Differential Gene expression and Preliminary ORA"
+author: "Wing Chung Jessie Lam"
+subtitle: "BCB420 - Computational Systems Biology. University of Toronto"
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_depth: 3
+    html_notebook: null
+bibliography: A2_references.bib
+---
+
+# Introduction 
+## Data set I am using
+The dataset I am using is the dataset [GSE155257](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE155257). This dataset is from the paper MicroRNA analysis of human stroke brain tissue resected during decompressive craniectomy/stroke-ectomy surgery [@carlson2021microrna]. 
+
+Previously, I downloaded the the dataset [GSE155257](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE155257). The dataset specifies genes using ensembl IDs. I cleaned the data by removing for low counts by the recommended edgeR protocol. Then, I normalized the data using TMM normalization using the edgeR package [@edgeRCitation]. Afterwards, I mapped the data to HUGO symbols using the biomaRt R package [@BioMartCitation]. I removed any genes that cannot be mapped to HUGO symbols, and duplicate rows where ensembl IDs were mapped to multiple HGNC symbols. I then exported the data as a csv file called finalDF.csv that I will be using in this report.
+
+The code of the above steps can be accessed [here](https://github.com/bcb420-2023/Wing_Lam/blob/main/A1/A1.Rmd)
+
+
+## What I will be doing in this report
+In this report, I will be doing 2 main things: 
+
+1. I will be conducting differential gene expression on the above mentioned dataset I previously processed. I will be looking for significantly differentially expressed genes, then conducting multiple hypothesis testing to correct the p-values. I will be visualizing the top hits using a heatmap. I will then save 2 sets of genes: downregulated genes after correction and upregulated genes after correction. 
+
+2. I will then be conducting thresholded over-representation analysis on the up-regulated and down-regulated set of genes. Threshold analysis will be done using the Gprofiler tool. I will first try to do this using Gprofiler R interface, gprofiler2 [@gprofiler2Citation]. 
+
+# Processing
+## Install required libraries
+```{r}
+if (!requireNamespace("gprofiler2", quietly = TRUE))
+  install.packages("gprofiler2")
+if (!requireNamespace("ggrepel", quietly = TRUE))
+  install.packages("ggrepel")
+```
+
+## Load required libraries
+```{r}
+library(magrittr)
+```
+
+## Load data file
+Read in the file created I previously cleaned, normalized and mapped to HUGO symbols.
+```{r}
+normalizedCountData <- read.csv("finalDF.csv", row.names = 1, header= TRUE)
+normalizedCountData
+```
+
+## Defining groups in our data
+This experiment has 2 groups, normal non-stroke brain tissue samples (control condition) and stroke tissue samples (test condition). 
+```{r}
+sampleNames <- c("non-stroke_rep1", "non-stroke_rep2", "non-stroke_rep3", "stroke_rep1", "stroke_rep2", "stroke_rep3", "stroke_rep4", "stroke_rep5")
+diseaseState <- c("non-stroke", "non-stroke", "non-stroke", "stroke", "stroke", "stroke", "stroke", "stroke")
+samples <- data.frame(diseaseState)
+rownames(samples) <- sampleNames
+samples
+```
+
+## MDS Plot and Model factors 
+I will visualize the data using an MDS plot to see distance between the samples. 
+```{r}
+# Create DGEList object to be used by edgeR
+filteredDataMatrix <- as.matrix(normalizedCountData)
+d <- edgeR::DGEList(counts=filteredDataMatrix, group=samples$diseaseState)
+limma::plotMDS(d, label=rownames(samples), col=c("darkgreen", "blue")[factor(samples$diseaseState)])
+```
+
+**Figure 1.** MDS plot to show the distances between all samples 
+
+From the plot, we can see that the main factor that determines simillarity between samples is the disease state (all non-stroke samples cluster together). Therefore, I will be using only the disease state when creating our model.
+```{r}
+# Create our data matrix
+modelDesign <- model.matrix(~samples$diseaseState)
+```
+
+## Differential Gene Expression
+The p-values of the genes in the expression set will be calculated using the Benjamini-Hochberg (BH) FDR multiple testing procedure [@BHCitation]. This is calculated when using the glmQLFTest method. I chose to use the BH method as it is not overly stringent and results in less false negatives when compared to other popular multiple hypothesis testing methods such as the Bonferroni method [@BHCitation]. However, there are more false positives when using the Benjamini-Hochberg (BH) method when compared to other popular multiple hypothesis testing methods such as the Bonferroni methond [@BHCitation]. 
+```{r}
+d <- edgeR::estimateDisp(d, modelDesign)
+d <- edgeR::calcNormFactors(d)
+fit <- edgeR::glmQLFit(d, modelDesign)
+qlf.strokeVScontrol <- edgeR::glmQLFTest(fit, coef = 'samples$diseaseStatestroke')
+qlfOutputHits <- edgeR::topTags(qlf.strokeVScontrol, sort.by = "PValue", n=nrow(filteredDataMatrix))
+```
+
+How many genes pass the threehold p-value < 0.05?
+```{r}
+length(which(qlfOutputHits$table$PValue < 0.05))
+length(which(qlfOutputHits$table$FDR < 0.05))
+```
+
+1624 genes have significant p-values but only 205 genes have significant p-values after correction. I used the threshold 0.05 as that is the typical cutoff for p-values. 
+
+Now I will visualize my differentially expressed genes using a volcano plot. The code to make the volcano references the code in [@volcanoPlotCitation]
+```{r}
+qlfOutputHitsCopy <- qlfOutputHits
+
+# add a column of NAs
+qlfOutputHitsCopy$table$`diffexpressed` <- "NO"
+# if log2Foldchange > 0.6 and pvalue < 0.05, set as "UP" 
+qlfOutputHitsCopy$table$diffexpressed[qlfOutputHitsCopy$table$logFC > 0.6 & qlfOutputHitsCopy$table$PValue < 0.05] <- "UP"
+# if log2Foldchange < -0.6 and pvalue < 0.05, set as "DOWN"
+qlfOutputHitsCopy$table$diffexpressed[qlfOutputHitsCopy$table$logFC < -0.6 & qlfOutputHitsCopy$table$PValue < 0.05] <- "DOWN"
+
+qlfOutputHitsCopy$table$delabel <- NA
+qlfOutputHitsCopy$table$delabel[qlfOutputHitsCopy$table$diffexpressed != "NO"] <- rownames(qlfOutputHitsCopy$table)[qlfOutputHitsCopy$table$diffexpressed != "NO"]
+
+ggplot2::ggplot(data=qlfOutputHitsCopy$table, ggplot2::aes(x=logFC, y=-log10(PValue), col=diffexpressed, label=delabel)) +
+        ggplot2::geom_point() + 
+        ggplot2::theme_minimal() +
+        ggrepel::geom_text_repel() +
+        ggplot2::scale_color_manual(values=c("blue", "black", "red")) +
+        ggplot2::geom_vline(xintercept=c(-0.6, 0.6), col="red") +
+        ggplot2::geom_hline(yintercept=-log10(0.05), col="red") +
+        ggplot2::ggtitle("Volcano plot of genes in Stroke VS Control Samples")
+```
+
+**Figure 2.** Volcano plot showing differentially expressed genes in Stroke VS Control Samples
+
+Visualize top hits using a heatmap
+```{r}
+heatmapMatrix <- normalizedCountData
+topHits <- rownames(qlfOutputHits$table[which(qlfOutputHits$table$FDR < 0.05),])
+heatmapMatrixTophits <- t(
+ scale(t(heatmapMatrix[
+ which(rownames(heatmapMatrix) %in% topHits),])))
+if(min(heatmapMatrixTophits) == 0){
+ heatmapCol = circlize::colorRamp2(c( 0, max(heatmapMatrixTophits)),
+ c( "white", "red"))
+ } else {
+ heatmapCol = circlize::colorRamp2(c(min(heatmapMatrixTophits), 0,
+ max(heatmapMatrixTophits)), c("blue", "white", "red"))
+ }
+currentHeatmap <- ComplexHeatmap::Heatmap(as.matrix(heatmapMatrixTophits),
+ cluster_rows = TRUE,
+ cluster_columns = TRUE,
+ show_row_dend = TRUE,
+ show_column_dend = TRUE,
+ col=heatmapCol,
+ show_column_names = TRUE,
+ show_row_names = FALSE,
+ show_heatmap_legend = TRUE,
+ )
+currentHeatmap
+```
+
+**Figure 3** Heatmap that visualizes top hits in all samples
+
+We can see that the nonstroke and stroke conditions do somewhat cluster together. The genes in the bottom of the heatmap are upregulated for all non-stroke samples, and downregulated for all stroke sample. However, we can see that in the stroke samples there are different sets of genes that are upregulated in different stroke samples.
+
+Getting upregulated and downregulated genes
+```{r}
+outputHitsTable <- qlfOutputHits$table
+upregulatedGenes <- rownames(outputHitsTable)[
+  which(outputHitsTable$PValue < 0.05
+             & outputHitsTable$logFC > 0)]
+downregulatedGenes <- rownames(outputHitsTable)[
+  which(outputHitsTable$PValue < 0.05
+             & outputHitsTable$logFC < 0)]
+allSignificantGenes <- rownames(outputHitsTable)[
+  which(outputHitsTable$PValue < 0.05)]
+length(upregulatedGenes)
+length(downregulatedGenes)
+length(allSignificantGenes)
+length(allSignificantGenes) - length(upregulatedGenes) - length(downregulatedGenes)
+```
+
+Save upregulated and downregulated genes into files
+```{r}
+write.table(x=upregulatedGenes,
+            file=file.path("upregulatedGenes.txt"),sep = "\t",
+            row.names = FALSE,col.names = FALSE,quote = FALSE)
+write.table(x=downregulatedGenes,
+            file=file.path("downregulatedGenes.txt"),sep = "\t",
+            row.names = FALSE,col.names = FALSE,quote = FALSE)
+write.table(x=allSignificantGenes,
+            file=file.path("allSignificantGenes.txt"),sep = "\t",
+            row.names = FALSE,col.names = FALSE,quote = FALSE)
+```
+
+## Thresholded over-representation analysis
+```{r}
+versionInfo <- gprofiler2::get_version_info(organism = "hsapiens")
+gostUpReg <- gprofiler2::gost(query = upregulatedGenes,
+organism = "hsapiens", correction_method = "fdr", sources=c("GO:BP", "REAC", "WP"), exclude_iea=TRUE, significant=FALSE)
+
+gostDownReg <- gprofiler2::gost(query = downregulatedGenes,
+organism = "hsapiens", correction_method = "fdr", sources=c("GO:BP", "REAC", "WP"), exclude_iea=TRUE, significant=FALSE)
+
+gostAllSig <- gprofiler2::gost(query = allSignificantGenes,
+organism = "hsapiens", correction_method = "fdr", sources=c("GO:BP", "REAC", "WP"), exclude_iea=TRUE, significant=FALSE)
+```
+
+#### Top terms in each source with term size between 5 and 200
+
+##### Upregulated genes
+Here are the top terms of upregulated genes with term size between 5 and 200. As we can see, only GO:BP has one significant term with term size between 5 and 200.
+```{r}
+# GO:BP
+topUpGOBPWithinSize <- gostUpReg[1]$result %>% 
+  dplyr::filter(term_size >= 5 & term_size <= 200) %>%
+  dplyr::filter(source == "GO:BP") %>%
+  dplyr::select(term_name, term_id, term_size, source, p_value, significant) %>%
+  dplyr::arrange(p_value) %>% dplyr::slice(1:10)
+topUpGOBPWithinSize
+
+# REAC
+topUpREACWithinSize <- gostUpReg[1]$result %>% 
+  dplyr::filter(term_size >= 5 & term_size <= 200) %>%
+  dplyr::filter(source == "REAC") %>%
+  dplyr::select(term_name, term_id, term_size, source, p_value, significant) %>%
+  dplyr::arrange(p_value) %>% dplyr::slice(1:10)
+topUpREACWithinSize 
+
+# WP
+topUpWPWithinSize <- gostUpReg[1]$result %>% 
+  dplyr::filter(term_size >= 5 & term_size <= 200) %>%
+  dplyr::filter(source == "WP") %>%
+  dplyr::select(term_name, term_id, term_size, source, p_value, significant) %>%
+  dplyr::arrange(p_value) %>% dplyr::slice(1:10)
+topUpWPWithinSize
+```
+
+
+##### Downregulated genes
+Here are the top terms of downregulated genes with term size between 5 and 200. As we can see, all 3 sources (GO:BP, REAC and WP) have significant terms with term size between 5 and 200. 
+```{r}
+# GO:BP
+topDownGOBPWithinSize <- gostDownReg[1]$result %>% 
+  dplyr::filter(term_size >= 5 & term_size <= 200) %>%
+  dplyr::filter(source == "GO:BP") %>%
+  dplyr::select(term_name, term_id, source, p_value, significant) %>%
+  dplyr::arrange(p_value) %>% dplyr::slice(1:10)
+topDownGOBPWithinSize
+
+# REAC
+topDownREACWithinSize <- gostDownReg[1]$result %>% 
+  dplyr::filter(term_size >= 5 & term_size <= 200) %>%
+  dplyr::filter(source == "REAC") %>%
+  dplyr::select(term_name, term_id, source, p_value, significant) %>%
+  dplyr::arrange(p_value) %>% dplyr::slice(1:10)
+topDownREACWithinSize
+
+# WP
+topDownWPWithinSize <- gostDownReg[1]$result %>% 
+  dplyr::filter(term_size >= 5 & term_size <= 200) %>%
+  dplyr::filter(source == "WP") %>%
+  dplyr::select(term_name, term_id, source, p_value, significant) %>%
+  dplyr::arrange(p_value) %>% dplyr::slice(1:10)
+topDownWPWithinSize
+```
+
+##### All differentially expressed genes
+Here are the top terms of all differentially expressed genes with term size between 5 and 200. As we can see, all 3 sources (GO:BP, REAC and WP) have significant terms with term size between 5 and 200. 
+```{r}
+topAllGOBPWithinSize <- gostAllSig[1]$result %>% 
+  dplyr::filter(term_size >= 5 & term_size <= 200) %>%
+  dplyr::filter(source == "GO:BP") %>%
+  dplyr::select(term_name, term_id, source, p_value, significant) %>%
+  dplyr::arrange(p_value) %>% dplyr::slice(1:10)
+topAllGOBPWithinSize
+
+# REAC
+topAllREACWithinSize <- gostAllSig[1]$result %>% 
+  dplyr::filter(term_size >= 5 & term_size <= 200) %>%
+  dplyr::filter(source == "REAC") %>%
+  dplyr::select(term_name, term_id, source, p_value, significant) %>%
+  dplyr::arrange(p_value) %>% dplyr::slice(1:10)
+topAllREACWithinSize
+
+# WP
+topAllWPWithinSize <- gostAllSig[1]$result %>% 
+  dplyr::filter(term_size >= 5 & term_size <= 200) %>%
+  dplyr::filter(source == "WP") %>%
+  dplyr::select(term_name, term_id, source, p_value, significant) %>%
+  dplyr::arrange(p_value) %>% dplyr::slice(1:10)
+topAllWPWithinSize
+```
+
+### 1. Which method did you choose and why? 
+I decided to use GProfiler [@gProfilerCitation] to conduct thresholded over-representation analysis. I chose GProfiler as it is a consistently updated with data from Ensembl database [@gProfilerCitation], allowing us to work with up-to-date human gene data. GProfiler can also access multiple Gene sets for analysis, allowing for higher coverage on information that can be obtained my genes of interest. Additionally, GProfiler has an R interface with the package gprofiler2 [@gprofiler2Citation], allowing me to keep all my analysis steps within this notebook. We correct for multiple hypothesis testing using the Benjamin Hochberg FDR as it is not overly stringent and results in less false negatives when compared to other popular multiple hypothesis testing methods such as the Bonferroni method [@BHCitation].
+
+### 2. What annotation data did you use and why? What version of the annotation are you using?
+I decided to use the sources Reactome (REAC), Go biological process (GO:BP), and Wiki pathway (WP) and to remove all electronic GO annotations. I chose to do so as I wanted to follow the suggestions in the procedure of GProfiler in lecture 7. KEGG is not used as it sometimes produces pathways that are confusing and not useful. KEGG is also a paid service and I do not have a subscription. 
+
+For GO:BP, I am using version annotations: BioMart\nclasses: releases/2022-12-04
+
+For REAC, I am using version annotations: BioMart\nclasses: 2022-12-28
+
+For WP, I am using version 20221210
+
+### 3. How many genesets were returned with what thresholds?
+
+A total of `r nrow(gostUpReg[1]$result)` genesets were returned for upregulated genes, a total of `r nrow(gostDownReg[1]$result)` genesets were returned for downregulated genes and a total of `r nrow(gostAllSig[1]$result)` genesets were returned for all differentially expressed genes.
+
+```{r}
+gostUpReg[1]$result
+gostDownReg[1]$result
+gostAllSig[1]$result
+```
+
+At the significance threshold of 0.05, a total of `r nrow(gostUpReg[1]$result %>% dplyr::filter(significant == TRUE))` genesets were returned for upregulated genes, a total of `r nrow(gostDownReg[1]$result %>% dplyr::filter(significant == TRUE))` genesets were returned for downregulated genes and a total of `r nrow(gostAllSig[1]$result %>% dplyr::filter(significant == TRUE))` genesets were returned for all significantly differentially expressed genes.
+
+```{r}
+gostUpReg[1]$result %>% 
+  dplyr::filter(significant == TRUE)
+
+gostDownReg[1]$result %>% 
+  dplyr::filter(significant == TRUE)
+
+gostAllSig[1]$result %>% 
+  dplyr::filter(significant == TRUE)
+```
+
+### 4. Run the analysis using the up-regulated set of genes, and the down-regulated set of genes separately. How do these results compare to using the whole list (i.e all differentially expressed genes together vs. the up-regulated and down regulated differentially expressed genes separately)?
+When we look at the top term tables generated, when comparing the results of all differentially expressed genes together vs. the up-regulated and down regulated differentially expressed genes separately, the top terms do differ for all 3 sources (eg. the top 5 terms of all differentially expressed genes together is not a selection from the top 5 terms of up-regulated set of genes and the down-regulated set of genes). 
+
+# Interpretation
+
+When looking at the top terms of upregulated, downregulated, and all differentially expressed genes with term size between 5 and 200, there are multiple top terms that support the conclusions or mechanisms discussed in the original paper. 
+
+The paper mentions that biological pathways regulating synaptic plasticity strongly influence stroke progression and outcome, and they identified multiple biological processes relating to synaptic function. In my analysis, we see many terms that relate to synaptic function. 
+
+There are related terms from upregulated, downregulated, and all differentially expressed genes with term size between 5 and 200 that have significant p-values (at cutoff 0.05). Here are some of them
+
+- regulation of neuronal synaptic plasticity
+
+- regulation of synaptic plasticity
+
+- regulation of neuronal synaptic plasticity
+
+- chemical synaptic transmission, postsynaptic
+
+- regulation of postsynaptic membrane potential
+
+- dendrite development (as dentrites are what receives information in the synapses)
+
+- dendrite morphogenesis (as dentrites are what receives information in the synapses)
+
+The paper also mentions that inflammatory response is something that strongly affect stroke progression and outcome. Chaperone-mediated autophagy is a term that is found to be significant in upregulated genes. According to [@autophagyInStroke] autophagy is an inflammatory response to stroke)
+
+
+# References

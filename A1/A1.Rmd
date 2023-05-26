@@ -1,0 +1,393 @@
+---
+title: "Assignment 1"
+author: "Wing Chung Jessie Lam"
+subtitle: "BCB420 - Computational Systems Biology. University of Toronto"
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_depth: 2
+    html_notebook: null
+bibliography: A1_references.bib
+---
+
+# Introduction 
+In this notebook, I will be processing the dataset [GSE155257](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE155257). This dataset is from the paper MicroRNA analysis of human stroke brain tissue resected during decompressive craniectomy/stroke-ectomy surgery [@carlson2021microrna]. I will be cleaning the data, mapping the genes to HUGO symbols, and applying normalization.
+
+The experiment in the paper investigates the signalling pathways microRNAs mediate in stroke progression and recovery [@carlson2021microrna]. Carlson et al. collected human stroke brain tissue from 5 patients with malignant hemispehric stroke (test condition) and normal brain tissue from 3 patients who do not have a stroke (control condition). The data collected is RNA sequencing data.
+
+# Dataset selection
+I am particularly interested in the molecular interactions that occur within the brain, and have worked with analyzing mice stroke data as part of another course. So, when looking for a dataset, I aimed to look for an interesting stroke dataset. Details on how this particular dataset was found can be viewed in the accompanying [journal entry](https://github.com/bcb420-2023/Wing_Lam/wiki/2.0-Assignment-1/).
+
+# Procedure 
+
+## Install & load necessary packages
+```{r, message=FALSE}
+# Install necessary packages
+install.packages("readxl")
+install.packages("dplyr")
+
+# Load the magrittr library to allow the use of %>%
+library(magrittr)
+```
+
+## Get expression data
+```{r, message=FALSE, error=FALSE, warning=FALSE}
+# Create a directory to store GEO data if the directory does not already exist
+# Referenced robbrit's comment in  https://stackoverflow.com/questions/4216753/folder-management-with-r-check-existence-of-directory-and-create-it-if-it-does
+ifelse(!dir.exists(file.path(getwd(), "GSE155257")), 
+       dir.create(file.path(getwd(), "GSE155257")), FALSE)
+
+# Get dataset GSE as a GEO SOFT format file in its gzipped representation and store it in the "GSE155257" subdirectory if it does not already exist
+# Read the file into a GSE object in R
+if (file.exists("GSE155257/GSE155257.soft.gz")) {
+  gse <- GEOquery::getGEO(filename = "GSE155257/GSE155257.soft.gz", GSEMatrix=FALSE)
+} else { 
+  gse <- GEOquery::getGEO("GSE155257", destdir = "GSE155257", GSEMatrix=FALSE)
+}
+  
+# Checks if expression data is already downloaded. If not, get the expression data
+if (file.exists("GSE155257/GSE155257_Raw_miRBase_Counts_All_Samples.xlsx")) {
+  brainTissueExp <- readxl::read_excel("GSE155257/GSE155257_Raw_miRBase_Counts_All_Samples.xlsx")
+} else {
+  sfiles <- GEOquery::getGEOSuppFiles("GSE155257") # We get both the normalized and raw counts here
+  
+  # For now, we only need to use the raw counts
+  brainTissueExp <- readxl::read_excel("GSE155257/GSE155257_Raw_miRBase_Counts_All_Samples.xlsx")
+}
+```
+
+
+We will change the column names to better represent the control vs test conditions, as the current column names are not indicative of which sample it is. Columns are mapped to samples based on the assumption that the columns show up in the same order samples show up in the GEO series. 
+```{r}
+colnames(brainTissueExp)
+colnames(brainTissueExp)[3:10] <- c("non-stroke_rep1", "non-stroke_rep2", "non-stroke_rep3", "stroke_rep1", "stroke_rep2", "stroke_rep3", "stroke_rep4", "stroke_rep5")
+colnames(brainTissueExp)
+```
+
+
+Let's have a quick peek at out dataset 
+```{r}
+head(brainTissueExp)
+```
+
+
+## Assess data quality
+Each sample (both control and test) has `r dim(brainTissueExp)[1]` rows of gene data. Each row represents a unique gene and there are no duplications. Each row contains the gene name, gene ensembl identifier, and corresponding gene expression values for each sample. There are 0 missing values for gene names, gene ensembl identifiers and gene expression values.
+
+```{r}
+# Number of genes 
+dim(brainTissueExp)[1] # 45368
+
+# Create a dataframe that count how many times each gene shows up
+summarizedGeneCounts <- as.data.frame(sort(table(brainTissueExp[1]), decreasing=TRUE)) #this line of code references the code from lecture 4
+# The max number of times each gene shows up is 1, meaning there are no duplicates
+max(summarizedGeneCounts$Freq) #1
+      
+# Check for NA values in the dataframe brainTissueExp
+containsNA <- anyNA(brainTissueExp$"Name") && anyNA(brainTissueExp$"Identifier") && anyNA(brainTissueExp$"non-stroke_rep1") && anyNA(brainTissueExp$"non-stroke_rep2") && anyNA(brainTissueExp$"non-stroke_rep3") && anyNA(brainTissueExp$"stroke_rep1") && anyNA(brainTissueExp$"stroke_rep2") && anyNA(brainTissueExp$"stroke_rep3") && anyNA(brainTissueExp$"stroke_rep4") && anyNA(brainTissueExp$"stroke_rep5")
+
+# There are no NA values in any column
+containsNA #FALSE
+```
+
+## Filter data for low counts 
+Here I filter out data with low counts, as recommended by the edgeR protocol. After filtering out data with low counts, there are 16622 genes remaining. 
+```{r}
+# translate out counts into counts per million using the edgeR package function cpm
+cpms <- edgeR::cpm(brainTissueExp[,3:10])
+
+# get rid of low counts
+keep <- rowSums(cpms > 1) >= 3
+brainTissueExpFiltered <- brainTissueExp[keep,]
+
+# Genes remaining
+dim(brainTissueExpFiltered)[1] #16622
+```
+
+## Experimental groups  
+This experiment has 2 groups, normal non-stroke brain tissue samples (control condition) and stroke tissue samples (test condition). 
+
+In the following code chunk, I represent the samples and their experimental groups as a dataframe.
+```{r}
+# Store the samples and the experimental groups they belong to in a dataframe
+sampleNames <- colnames(brainTissueExp)[3:10]
+diseaseState <- c("non-stroke", "non-stroke", "non-stroke", "stroke", "stroke", "stroke", "stroke", "stroke")
+samples <- data.frame(diseaseState)
+rownames(samples) <- sampleNames
+samples
+```
+
+## Normalize data
+To decide on which normalization method to use, let us look at the distribution of our data
+
+### Boxplots
+```{r, warning=FALSE}
+# Code taken from lecture 4
+
+data2plot <- log2(edgeR::cpm(brainTissueExpFiltered[,3:10]))
+boxplot(data2plot, xlab = "Samples", ylab = "log2 CPM",
+ las = 2, cex = 0.5, cex.lab = 0.5,
+ cex.axis = 0.5, main = "RNASeq Samples")
+#draw the median on each box plot
+abline(h = median(apply(data2plot, 2, median)),
+ col = "green", lwd = 0.6, lty = "dashed")
+```
+
+We can see that there are some technical variation amoung the data. However, the box plot for stroke_rep5 is distinctly different from the others. The median line is close to 0 and there is no visible first and third quantile. This may be an indication of potential technical error. 
+
+### Density plots
+```{r}
+densityPlot <- function(countsDensity, legendLabels) {
+  #calculate the limits across all the samples
+  xlim <- 0; ylim <- 0
+  for (i in 1:length(countsDensity)) {
+  xlim <- range(c(xlim, countsDensity[[i]]$x));
+  ylim <- range(c(ylim, countsDensity[[i]]$y))
+  }
+  cols <- rainbow(length(countsDensity))
+  ltys <- rep(1, length(countsDensity))
+  #plot the first density plot to initialize the plot
+  plot(countsDensity[[1]], xlim=xlim, ylim=ylim, type="n",
+  ylab="Smoothing density of log2-CPM",
+  main="", cex.lab = 0.85)
+  #plot each line
+  for (i in 1:length(countsDensity))
+  lines(countsDensity[[i]], col=cols[i], lty=ltys[i])
+  #create legend
+  legend("topright", legendLabels,
+  col=cols, lty=ltys, cex=0.75,
+  border ="blue", text.col = "green4",
+  merge = TRUE, bg = "gray90") 
+}
+
+countsDensityAll <- apply(log2(edgeR::cpm(brainTissueExpFiltered[,3:10])),
+  2, density)
+densityPlot(countsDensityAll, colnames(data2plot))
+
+par(mfrow=c(3,3))
+tissueCountsDensity3 <- apply(log2(edgeR::cpm(brainTissueExpFiltered[,3])),
+  2, density)
+densityPlot(tissueCountsDensity3, "non-stroke_rep1")
+
+tissueCountsDensity4 <- apply(log2(edgeR::cpm(brainTissueExpFiltered[,4])),
+  2, density)
+densityPlot(tissueCountsDensity4, "non-stroke_rep2")
+
+tissueCountsDensity5 <- apply(log2(edgeR::cpm(brainTissueExpFiltered[,5])),
+  2, density)
+densityPlot(tissueCountsDensity5, "non-stroke_rep3")
+
+tissueCountsDensity6 <- apply(log2(edgeR::cpm(brainTissueExpFiltered[,6])),
+  2, density)
+densityPlot(tissueCountsDensity6, "stroke_rep1")
+
+tissueCountsDensity7 <- apply(log2(edgeR::cpm(brainTissueExpFiltered[,7])),
+  2, density)
+densityPlot(tissueCountsDensity7, "stroke_rep2")
+
+tissueCountsDensity8 <- apply(log2(edgeR::cpm(brainTissueExpFiltered[,8])),
+  2, density)
+densityPlot(tissueCountsDensity8, "stroke_rep3")
+
+tissueCountsDensity9 <- apply(log2(edgeR::cpm(brainTissueExpFiltered[,9])),
+  2, density)
+densityPlot(tissueCountsDensity9, "stroke_rep4")
+
+tissueCountsDensity10 <- apply(log2(edgeR::cpm(brainTissueExpFiltered[,10])),
+  2, density)
+densityPlot(tissueCountsDensity10, "stroke_rep5")
+par(mfrow=c(1,1))
+```
+
+From our density plots, we can see that the data is generally distributed quite similarly across samples, with the exception of stroke_rep3 and stroke_rep4 which have distinctly different distributions from the others but are simillar to each other. 
+
+### Normalization method
+The paper of this dataset uses TMM as the normalization method. We will also be using TMM as our normalization method. 
+
+```{r}
+# Create DGEList object to be used by edgeR
+filteredDataMatrix <- as.matrix(brainTissueExpFiltered[,3:10])
+rownames(filteredDataMatrix) <- brainTissueExpFiltered$Identifier
+d <- edgeR::DGEList(counts=filteredDataMatrix, group=samples$diseaseState)
+
+# Calculate the normalization factors 
+d <- edgeR::calcNormFactors(d)
+normalizedCounts <- edgeR::cpm(d)
+```
+
+### Data distribution before and after normalization
+
+#### Box plots
+```{r, warning=FALSE}
+preNorm <- log2(edgeR::cpm(brainTissueExpFiltered[,3:10]))
+boxplot(preNorm, xlab = "Samples", ylab = "log2 CPM",
+ las = 2, cex = 0.5, cex.lab = 0.5,
+ cex.axis = 0.5, main = "Box plot before normalization")
+#draw the median on each box plot
+abline(h = median(apply(preNorm, 2, median)),
+ col = "green", lwd = 0.6, lty = "dashed")
+
+postNorm <- log2(edgeR::cpm(normalizedCounts))
+boxplot(postNorm, xlab = "Samples", ylab = "log2 CPM",
+ las = 2, cex = 0.5, cex.lab = 0.5,
+ cex.axis = 0.5, main = "Box plot after normalization")
+#draw the median on each box plot
+abline(h = median(apply(postNorm, 2, median)),
+ col = "green", lwd = 0.6, lty = "dashed")
+
+```
+
+#### Density plots 
+```{r, warning=FALSE}
+preNormDensity <- apply(log2(edgeR::cpm(brainTissueExpFiltered[,3:10])),
+  2, density)
+densityPlot(preNormDensity, colnames(data2plot))
+
+postNormDensity <- apply(log2(edgeR::cpm(normalizedCounts)),
+  2, density)
+densityPlot(postNormDensity, colnames(data2plot))
+```
+
+Unfortunately, the data distribution does not seem to have changed too much after normalization. 
+
+### MDS plot to see distances between samples
+```{r}
+limma::plotMDS(d, label=rownames(samples), col=c("darkgreen", "blue")[factor(samples$diseaseState)])
+```
+
+### Dispersion 
+```{r}
+modelDesign <- stats::model.matrix(~samples$diseaseState + 0)
+d <- edgeR::estimateDisp(d, modelDesign)
+edgeR::plotBCV(d, col.tagwise="black", col.common="red")
+edgeR::plotMeanVar(d, show.raw.vars=TRUE, show.tagwise.vars=TRUE, show.ave.raw.vars=TRUE, NBline=TRUE, show.binned.common.disp.vars=TRUE)
+```
+
+## Map to HUGO symbols
+```{r}
+# Accessing ensembl data using biomart 
+ensembl <- biomaRt::useMart("ensembl")
+ensembl <- biomaRt::useDataset("hsapiens_gene_ensembl", mart=ensembl)
+
+# Convert human ensembl IDs to HGNC symbols 
+conversionStash <- "brainTissueExpIDConversion.rds"
+if (file.exists(conversionStash)) {
+  brainTissueExpIDConversion <- readRDS(conversionStash)
+} else {
+  brainTissueExpIDConversion <- biomaRt::getBM(
+    attribute = c("ensembl_gene_id", "hgnc_symbol"),
+    filters = c("ensembl_gene_id"),
+    values = brainTissueExpFiltered$Identifier,
+    mart = ensembl)
+  saveRDS(brainTissueExpIDConversion, conversionStash)
+}
+
+# Investigate how many genes we were able to map
+length(which(rownames(normalizedCounts) %in% brainTissueExpIDConversion$ensembl_gene_id)) # 16572
+
+# Investigate how many genes we were not able ot map
+`%notin%` <- Negate(`%in%`)
+length(which(rownames(normalizedCounts) %notin% brainTissueExpIDConversion$ensembl_gene_id)) # 50
+
+# Investigate how many HGNC symbols are the empty string
+sum(brainTissueExpIDConversion$hgnc_symbol == "") # 1204
+
+# Merge identifiers
+normalizedCountsAnnot <- merge(brainTissueExpIDConversion, normalizedCounts, by.x = 1, by.y = 0)
+
+# Investigate whether there are duplicates
+occurences <- data.frame(table(normalizedCountsAnnot$ensembl_gene_id))
+occurences[occurences$Freq > 1,] # There are two ensembl ids that are mapped to more than one HUGO symbol, ENSG00000230417 and ENSG00000276085	
+normalizedCountsAnnot[(normalizedCountsAnnot$ensembl_gene_id == "ENSG00000230417") | (normalizedCountsAnnot$ensembl_gene_id == "ENSG00000276085"), ]
+# Remove duplicates 
+normalizedCountsAnnot <- normalizedCountsAnnot[(normalizedCountsAnnot$hgnc_symbol != "LINC00856") & (normalizedCountsAnnot$hgnc_symbol != "CCL3L3"), ]
+
+# Investigate how many genes have missing HGNC symbols 
+ensemblIdNA <- normalizedCountsAnnot$ensembl_gene_id[which(is.na(normalizedCountsAnnot$hgnc_symbol))] # There are no NA values
+ensemblIdEmptyString <- normalizedCountsAnnot$ensembl_gene_id[which(normalizedCountsAnnot$hgnc_symbol == "")]
+ensemblIdMissing <- c(ensemblIdNA, ensemblIdEmptyString)
+length(ensemblIdMissing) #1204
+normalizedCountsAnnotWithHUGO <- subset(normalizedCountsAnnot, !(ensembl_gene_id %in% ensemblIdMissing)) 
+nrow(normalizedCountsAnnotWithHUGO) # 15368
+```
+Out of the 16622 genes we have after removing for low counts, we were able to map 16572 genes. However, out of the 16572 genes we were able to map, the hgnc symbols of 1204 of them were retrieved as empty strings. This means, that in actuality, only 15368 genes were successfully mapped. 
+Additionally, 2 genes had 2 hgnc gene symbol mappings each. I looked up the genes by their hgnc symbols and realized the hgnc symbols do correspond to the same gene on ensembl. I decided to keep the gene name that is currently on the ensembl gene page for each gene.
+
+For details:
+
+ENSG00000230417 maps to [LINC00856](https://www.genecards.org/cgi-bin/carddisp.pl?gene=LINC00856) and [LINC00595](https://www.genecards.org/cgi-bin/carddisp.pl?gene=LINC00595).
+But the [current ensembl page with ENSG00000230417](https://asia.ensembl.org/Homo_sapiens/Gene/Summary?g=ENSG00000230417;r=10:78179185-78551355) calls the gene LINC00595, so I am keeping that row. 
+
+ENSG00000276085 maps to [CCL3L1](https://www.genecards.org/cgi-bin/carddisp.pl?gene=CCL3L1) and [CCL3L3](https://www.genecards.org/cgi-bin/carddisp.pl?gene=CCL3L3). But the [current ensembl page with ENSG00000276085](https://asia.ensembl.org/Homo_sapiens/Gene/Summary?g=ENSG00000276085;r=17:36194869-36196758) calls the gene CCL3L1, so I am keeping that row. 
+
+```{r}
+# Add back gene names provided in original dataset 
+OldMapping <- merge(brainTissueExp[,1:2], data.frame(ensemblIdMissing), by.x = 2, by.y = 1, all.y=TRUE)
+
+OldMapping[order(OldMapping$Name),]
+
+# Identified patterns  
+OldMapping[grep(OldMapping$Name, pattern = "AC"),]
+OldMapping[grep(OldMapping$Name, pattern = "AL"),]
+OldMapping[grep(OldMapping$Name, pattern = "Y_RNA"),]
+OldMapping[grep(OldMapping$Name, pattern = "5_8S_rRNA"),]
+OldMapping[grep(OldMapping$Name, pattern = "AP"),]
+OldMapping[grep(OldMapping$Name, pattern = "FP"),]
+OldMapping[grep(OldMapping$Name, pattern = "BX"),]
+```
+
+Rows mapped to same HGNC symbol 
+```{r}
+hgncSymbolOccur <- data.frame(table(normalizedCountsAnnotWithHUGO$hgnc_symbol))
+hgncSymbolOccur[hgncSymbolOccur$Freq > 1,]
+normalizedCountsAnnotWithHUGO %>%
+  dplyr::filter(hgnc_symbol == "PINX1" | hgnc_symbol == "SCARNA4" | hgnc_symbol == "SNORD38B" )
+```
+There are some rows maped to the same HGNC symbols.
+
+## Final dataset
+Create final dataframe that conforms to the format specified in assignment 1 instructions: dataframe with x numeric columns (depending on how many samples you have). All rows should have a unique HUGO symbols, and the HUGO symbols must be defined as rownames of the dataframe.
+
+```{r}
+# Since we want rows to have rownames of hugo symbols, we need to remove all rows with the same HGNC symbol
+normalizedCountsAnnotWithHUGO 
+finalDF <- normalizedCountsAnnotWithHUGO %>%
+    dplyr::filter((hgnc_symbol != "PINX1") & (hgnc_symbol != "SCARNA4") & (hgnc_symbol != "SNORD38B"))
+rownames(finalDF) <- finalDF[,2]
+finalDF <- finalDF[-c(1,2)]
+finalDF
+```
+
+
+# Summary results
+
+### What are the control and test conditions of the dataset?
+The test condition of the dataset are brain tissue samples collected from stroke patients, while the test condition of the dataset are brain tissue samples collected from non-stroke patients.
+
+### Why is the dataset of interest to you?
+This dataset is of interest to me as I am interested in the molecular interactions that occur within the brain and have previously worked with stroke data. I would like to use this opportunity to continue investigating stroke datasets. 
+
+### Were there expression values that were not unique for specific genes? How did you handle these?
+There were no duplications in expression values. 
+
+### Were there expression values that could not be mapped to current HUGO symbols?
+There were 1204 genes that could not be mapped to HUGO symbols. 
+
+### How many outliers were removed?
+We started off with 45368 genes. After removing for low counts, we have 16622 genes remaining. Additionally, we removed genes that cannot be mapped to HUGO symbols or have duplicated HUGO symbols. Hence we removed a total of 29956 genes.
+
+However, this is just due to the requirement of the final dataframe having HUGO symbols as row names. I believe it is worth it to still analyze the rows that did not get removed for low counts but do not have HUGO symbols or have duplicated HUGO symbols in the future. The total number of genes we removed is 28746 instead if we keep those rows.
+
+### How did you handle replicates?
+Sample replicates were grouped into non-stroke (normal) group and stroke group in the code. 
+
+### What is the final coverage of your dataset?
+After removing low counts, the coverage of the dataset is 16622/45368 = 37% (This 37% contains rows with no HUGO symbols or have duplicate HUGO symbols. However, I believe it is worth it to keep them in next step analysis.)
+
+After removing the rows with no HUGO symbols or have duplicate HUGO symbols, the coverage of the final dataframe is 15,362/45368 = 34%. 
+
+# References
+Ruth Isserlin, BCB420 Lectures (2023)
+GeneCaRNA the human ncRNA Gene Database (2023)
+Ensembl (2023)
