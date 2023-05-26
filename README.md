@@ -9,7 +9,7 @@ All analysis is primarily done through R, with environments controlled using Doc
 Phase 1 - Data set selection and initial Processing (Steps and code can easily be viewed [here](https://htmlpreview.github.io/?https://github.com/jessielam415/ComputationalBiologyAnalysis/blob/main/A1/A1.html))
 -  Selecting a data set based on interest. 
     - I was particularly interested in selecting a stroke dataset as I am particularly interested in stroke recovery, and have previously been involved in research projects that investigate the molecules that affect stroke recovery
-    - To look for a dataset of interest, I took the steps that are outlined in [SelectingDataset.md](https://htmlpreview.github.io/?https://github.com/jessielam415/ComputationalBiologyAnalysis/blob/main/A1/SelectingDataset.md)
+    - To look for a dataset of interest, I took the steps that are outlined in [SelectingDataset.md](https://github.com/jessielam415/ComputationalBiologyAnalysis/blob/main/A1/SelectingDataset.md)
 - Clean the data and map to HUGO symbols
 - Apply Normalization
 - Interpret and document results
